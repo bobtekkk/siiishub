@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::download::{http_id_for, DownloadKind, DownloadRecord, HttpStats};
+use crate::download::{http_id_for, DownloadKind, DownloadManager, DownloadRecord, HttpStats};
 use crate::state::AppState;
 use crate::torrent::{sanitize_for_path, TorrentFileInfo, TorrentStats};
 use crate::torrent_file::{parse_torrent_bytes, ParsedTorrent};
@@ -198,14 +199,16 @@ fn torrent_disk_files(folder: &Path) -> Vec<(PathBuf, u64)> {
     out
 }
 
-fn http_download_failed(state: &Arc<AppState>, id: &str, error: String, progress: Option<(u64, u64)>) {
+fn http_download_failed(downloads: &DownloadManager, id: &str, error: String, progress: Option<(u64, u64)>) {
     let (downloaded, length) = progress.unwrap_or((0, 0));
-    state.downloads.set_http_stats(id, HttpStats {
+    downloads.set_http_stats(id, HttpStats {
         downloaded,
         length,
         error: Some(error),
         ..Default::default()
     });
+    // It runs no more: starting it again is not a duplicate.
+    downloads.clear_http_control(id);
 }
 
 fn find_download_record(state: &AppState, id: &str) -> CmdResult<DownloadRecord> {
@@ -1032,6 +1035,14 @@ pub async fn files(state: &AppState, id: String) -> CmdResult<Vec<TorrentFileInf
         .unwrap_or_default())
 }
 
+/// Failed attempts in a row after which an HTTP download gives up. An attempt
+/// that gets further into the file than any before starts the count again.
+const HTTP_MAX_RETRIES: u32 = 8;
+
+/// How long an HTTP download waits for data before it takes the connection for
+/// dead, which ends the attempt like any other network error.
+const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn spawn_http_download(
     state: Arc<AppState>,
     id: String,
@@ -1041,9 +1052,6 @@ fn spawn_http_download(
     poster_url: Option<String>,
     resume: bool,
 ) {
-    use futures::StreamExt;
-    use tokio::io::AsyncWriteExt;
-
     let control = match state.downloads.try_register_http_control(&id) {
         Some(c) => c,
         None => {
@@ -1054,225 +1062,383 @@ fn spawn_http_download(
     state.downloads.set_http_url(&id, url.clone());
 
     let dest = http_download_path(&state.download_dir, &title, &filename);
-    let part = crate::download::part_path(&dest);
-    let dest_dir = dest.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| state.download_dir.clone());
-    let cover_dir = dest_dir.clone();
+    let cover_dir = dest.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| state.download_dir.clone());
     let cover_http = state.http.clone();
     let cover_url = poster_url.clone();
     crate::util::spawn(async move {
         save_folder_cover(&cover_dir, cover_url.as_deref(), &cover_http).await;
     });
 
-    crate::util::spawn(async move {
-        let _ = tokio::fs::create_dir_all(&dest_dir).await;
+    crate::util::spawn(run_http_download(state.downloads.clone(), control, id, url, dest, resume));
+}
 
-        let resume_offset = if resume {
-            tokio::fs::metadata(&part).await.map(|m| m.len()).unwrap_or(0)
-        } else {
-            0
-        };
+/// Downloads `url` to `dest` through its `.part` file. A connection that fails
+/// or drops on the way is opened again, asking the server for the bytes the
+/// file still lacks.
+async fn run_http_download(
+    downloads: DownloadManager,
+    control: Arc<AtomicU8>,
+    id: String,
+    url: String,
+    dest: PathBuf,
+    resume: bool,
+) {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
 
-        state.downloads.set_http_stats(
-            &id,
-            HttpStats {
-                downloaded: resume_offset,
-                length: resume_offset,
-                progress: 0.0,
-                download_speed: 0.0,
-                done: false,
-                paused: false,
-                error: None,
-            },
-        );
+    let part = crate::download::part_path(&dest);
+    let dest_dir = dest.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| downloads.download_dir().clone());
+    let _ = tokio::fs::create_dir_all(&dest_dir).await;
 
-        let dl_client = match reqwest::Client::builder()
-            .user_agent("siiishub/0.1")
-            .gzip(false)
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("[download/http] {id} client build failed: {e:#}");
-                http_download_failed(&state, &id, format!("Errore client HTTP: {e}"), None);
-                return;
-            }
-        };
+    let resume_offset = if resume {
+        tokio::fs::metadata(&part).await.map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
 
-        let mut req = dl_client.get(&url);
-        if resume_offset > 0 {
-            req = req.header(reqwest::header::RANGE, format!("bytes={resume_offset}-"));
-        }
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("[download/http] {id} request failed: {e:#}");
-                http_download_failed(&state, &id, format!("Errore di rete: {e}"), Some((resume_offset, resume_offset)));
-                return;
-            }
-        };
+    downloads.set_http_stats(
+        &id,
+        HttpStats {
+            downloaded: resume_offset,
+            length: resume_offset,
+            progress: 0.0,
+            download_speed: 0.0,
+            done: false,
+            paused: false,
+            error: None,
+        },
+    );
 
-        let status = resp.status();
-        if !status.is_success() {
-            tracing::error!("[download/http] {id} HTTP {} from {url}", status.as_u16());
-
-            let body_preview = resp
-                .text()
-                .await
-                .ok()
-                .map(|s| s.chars().take(120).collect::<String>())
-                .unwrap_or_default();
-            let msg = if body_preview.is_empty() {
-                format!("HTTP {} dal CDN — link probabilmente scaduto", status.as_u16())
-            } else {
-                format!("HTTP {} dal CDN: {}", status.as_u16(), body_preview)
-            };
-            http_download_failed(&state, &id, msg, Some((resume_offset, resume_offset)));
+    let dl_client = match reqwest::Client::builder()
+        .user_agent("siiishub/0.1")
+        .gzip(false)
+        .read_timeout(HTTP_READ_TIMEOUT)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("[download/http] {id} client build failed: {e:#}");
+            http_download_failed(&downloads, &id, format!("Errore client HTTP: {e}"), None);
             return;
         }
+    };
 
-        let is_partial = status == reqwest::StatusCode::PARTIAL_CONTENT;
-        let (mut downloaded, total, mut file) = if is_partial && resume_offset > 0 {
-            let remaining = resp.content_length().unwrap_or(0);
-            let total = resume_offset.saturating_add(remaining);
-            match tokio::fs::OpenOptions::new().append(true).open(&part).await {
-                Ok(f) => (resume_offset, total, f),
-                Err(e) => {
-                    tracing::error!("[download/http] {id} open .part for append failed: {e:#}");
-                    http_download_failed(&state, &id, format!("Errore scrittura: {e}"), Some((resume_offset, total)));
-                    return;
-                }
+    // The bytes in the .part file, the size of the whole file once the server
+    // gave it, and how far into the file any attempt got.
+    let mut downloaded = resume_offset;
+    let mut total = 0u64;
+    let mut furthest = downloaded;
+    let mut retries = 0u32;
+
+    'download: loop {
+        // One attempt. What another one can fix ends it with the error to show
+        // if the attempts run out; anything else ends the download.
+        let dropped = 'attempt: {
+            let mut req = dl_client.get(&url);
+            if downloaded > 0 {
+                req = req.header(reqwest::header::RANGE, format!("bytes={downloaded}-"));
             }
-        } else {
-            let total = resp.content_length().unwrap_or(0);
-            match tokio::fs::File::create(&part).await {
-                Ok(f) => (0u64, total, f),
+            let resp = match req.send().await {
+                Ok(r) => r,
                 Err(e) => {
-                    tracing::error!("[download/http] {id} create file failed: {e:#}");
-                    http_download_failed(&state, &id, format!("Errore scrittura: {e}"), None);
-                    return;
+                    tracing::error!("[download/http] {id} request failed: {e:#}");
+                    break 'attempt format!("Errore di rete: {e}");
                 }
+            };
+
+            let status = resp.status();
+            if !status.is_success() {
+                tracing::error!("[download/http] {id} HTTP {} from {url}", status.as_u16());
+
+                let body_preview = resp
+                    .text()
+                    .await
+                    .ok()
+                    .map(|s| s.chars().take(120).collect::<String>())
+                    .unwrap_or_default();
+                let msg = if body_preview.is_empty() {
+                    format!("HTTP {} dal CDN — link probabilmente scaduto", status.as_u16())
+                } else {
+                    format!("HTTP {} dal CDN: {}", status.as_u16(), body_preview)
+                };
+                if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    break 'attempt msg;
+                }
+                http_download_failed(&downloads, &id, msg, Some((downloaded, downloaded)));
+                return;
             }
-        };
 
-        let mut last_tick = std::time::Instant::now();
-        let mut last_downloaded: u64 = downloaded;
-        let mut stream = resp.bytes_stream();
-
-        while let Some(chunk) = stream.next().await {
-            match control.load(std::sync::atomic::Ordering::Relaxed) {
-                crate::download::HTTP_CANCEL => {
-                    drop(file);
-                    let _ = tokio::fs::remove_file(&part).await;
-                    if dest_dir != state.download_dir {
-                        cleanup_title_folder_if_empty(&dest_dir).await;
+            let is_partial = status == reqwest::StatusCode::PARTIAL_CONTENT;
+            let mut file = if is_partial && downloaded > 0 {
+                total = downloaded.saturating_add(resp.content_length().unwrap_or(0));
+                match tokio::fs::OpenOptions::new().append(true).open(&part).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::error!("[download/http] {id} open .part for append failed: {e:#}");
+                        http_download_failed(&downloads, &id, format!("Errore scrittura: {e}"), Some((downloaded, total)));
+                        return;
                     }
-                    state.downloads.clear_http_control(&id);
-                    tracing::info!("[download/http] {id} cancelled, partial file removed");
-                    return;
                 }
-                crate::download::HTTP_PAUSE => {
+            } else {
+                // Nothing to go on from, or a server that sends the whole file
+                // whatever the range asked.
+                downloaded = 0;
+                total = resp.content_length().unwrap_or(0);
+                match tokio::fs::File::create(&part).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::error!("[download/http] {id} create file failed: {e:#}");
+                        http_download_failed(&downloads, &id, format!("Errore scrittura: {e}"), None);
+                        return;
+                    }
+                }
+            };
+
+            let mut last_tick = std::time::Instant::now();
+            let mut last_downloaded: u64 = downloaded;
+            let mut stream = resp.bytes_stream();
+            let mut stream_error = None;
+
+            while let Some(chunk) = stream.next().await {
+                let asked = control.load(Ordering::Relaxed);
+                if asked != crate::download::HTTP_RUN {
                     let _ = file.flush().await;
                     drop(file);
-                    let progress = if total > 0 { downloaded as f64 / total as f64 } else { 0.0 };
-                    state.downloads.set_http_stats(
+                    stop_http_download(&downloads, &id, asked, &part, &dest_dir, (downloaded, total)).await;
+                    return;
+                }
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("[download/http] {id} stream error: {e:#}");
+                        stream_error = Some(format!("Errore di rete: {e}"));
+                        break;
+                    }
+                };
+                if let Err(e) = file.write_all(&chunk).await {
+                    tracing::error!("[download/http] {id} write failed: {e:#}");
+                    http_download_failed(&downloads, &id, format!("Errore scrittura: {e}"), Some((downloaded, total)));
+                    return;
+                }
+                downloaded += chunk.len() as u64;
+
+                let now = std::time::Instant::now();
+                if now.duration_since(last_tick).as_millis() >= 250 {
+                    let dt = now.duration_since(last_tick).as_secs_f64();
+                    let speed = if dt > 0.0 {
+                        (downloaded - last_downloaded) as f64 / dt
+                    } else {
+                        0.0
+                    };
+                    let progress = if total > 0 {
+                        downloaded as f64 / total as f64
+                    } else {
+                        0.0
+                    };
+                    downloads.set_http_stats(
                         &id,
                         HttpStats {
                             downloaded,
                             length: total,
                             progress,
-                            download_speed: 0.0,
+                            download_speed: speed,
                             done: false,
-                            paused: true,
+                            paused: false,
                             error: None,
                         },
                     );
-                    state.downloads.clear_http_control(&id);
-                    tracing::info!("[download/http] {id} paused at {downloaded} bytes");
-                    return;
+                    last_tick = now;
+                    last_downloaded = downloaded;
                 }
-                _ => {}
             }
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("[download/http] {id} stream error: {e:#}");
-                    http_download_failed(&state, &id, format!("Errore di rete: {e}"), Some((downloaded, total)));
-                    return;
-                }
-            };
-            if let Err(e) = file.write_all(&chunk).await {
+
+            // The next attempt and the rename take the file as holding
+            // `downloaded` bytes.
+            if let Err(e) = file.flush().await {
                 tracing::error!("[download/http] {id} write failed: {e:#}");
-                http_download_failed(&state, &id, format!("Errore scrittura: {e}"), Some((downloaded, total)));
+                http_download_failed(&downloads, &id, format!("Errore scrittura: {e}"), Some((downloaded, total)));
                 return;
             }
-            downloaded += chunk.len() as u64;
+            drop(file);
 
-            let now = std::time::Instant::now();
-            if now.duration_since(last_tick).as_millis() >= 250 {
-                let dt = now.duration_since(last_tick).as_secs_f64();
-                let speed = if dt > 0.0 {
-                    (downloaded - last_downloaded) as f64 / dt
-                } else {
-                    0.0
-                };
-                let progress = if total > 0 {
-                    downloaded as f64 / total as f64
-                } else {
-                    0.0
-                };
-                state.downloads.set_http_stats(
-                    &id,
-                    HttpStats {
-                        downloaded,
-                        length: total,
-                        progress,
-                        download_speed: speed,
-                        done: false,
-                        paused: false,
-                        error: None,
-                    },
-                );
-                last_tick = now;
-                last_downloaded = downloaded;
+            if let Some(error) = stream_error {
+                break 'attempt error;
             }
+            if total > 0 && downloaded < total {
+                tracing::error!("[download/http] {id} truncated: {downloaded}/{total} bytes (.part kept for resume)");
+                break 'attempt format!("Download incompleto: ricevuti {downloaded} di {total} byte");
+            }
+            break 'download;
+        };
+
+        if downloaded > furthest {
+            furthest = downloaded;
+            retries = 0;
         }
-
-        let _ = file.flush().await;
-        drop(file);
-
-        if total > 0 && downloaded < total {
-            tracing::error!("[download/http] {id} truncated: {downloaded}/{total} bytes (.part kept for resume)");
-            http_download_failed(
-                &state,
-                &id,
-                format!("Download incompleto: ricevuti {downloaded} di {total} byte"),
-                Some((downloaded, total)),
-            );
+        retries += 1;
+        if retries > HTTP_MAX_RETRIES {
+            http_download_failed(&downloads, &id, dropped, Some((downloaded, total)));
             return;
         }
-
-        if let Err(e) = tokio::fs::rename(&part, &dest).await {
-            tracing::error!(
-                "[download/http] {id} rename {} -> {} failed: {e:#}",
-                part.display(),
-                dest.display()
-            );
-            http_download_failed(&state, &id, format!("Errore scrittura: {e}"), Some((downloaded, total)));
-            return;
-        }
-        state.downloads.clear_http_control(&id);
-        state.downloads.set_http_stats(
+        let progress = if total > 0 { downloaded as f64 / total as f64 } else { 0.0 };
+        downloads.set_http_stats(
             &id,
-            HttpStats {
-                downloaded,
-                length: total.max(downloaded),
-                progress: 1.0,
-                download_speed: 0.0,
-                done: true,
-                paused: false,
-                error: None,
-            },
+            HttpStats { downloaded, length: total, progress, ..Default::default() },
         );
-        tracing::info!("[download/http] {id} done ({downloaded} bytes → {})", dest.display());
-    });
+
+        // 2, 4, 8, 16, then 30 seconds; a pause or a cancel cuts the wait short.
+        let wait = std::time::Duration::from_secs((1u64 << retries).min(30));
+        tracing::warn!(
+            "[download/http] {id} retry {retries} of {HTTP_MAX_RETRIES} in {}s, from byte {downloaded}",
+            wait.as_secs()
+        );
+        let until = std::time::Instant::now() + wait;
+        let mut asked = control.load(Ordering::Relaxed);
+        while asked == crate::download::HTTP_RUN && std::time::Instant::now() < until {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            asked = control.load(Ordering::Relaxed);
+        }
+        if asked != crate::download::HTTP_RUN {
+            stop_http_download(&downloads, &id, asked, &part, &dest_dir, (downloaded, total)).await;
+            return;
+        }
+    }
+
+    if let Err(e) = tokio::fs::rename(&part, &dest).await {
+        tracing::error!(
+            "[download/http] {id} rename {} -> {} failed: {e:#}",
+            part.display(),
+            dest.display()
+        );
+        http_download_failed(&downloads, &id, format!("Errore scrittura: {e}"), Some((downloaded, total)));
+        return;
+    }
+    downloads.clear_http_control(&id);
+    downloads.set_http_stats(
+        &id,
+        HttpStats {
+            downloaded,
+            length: total.max(downloaded),
+            progress: 1.0,
+            download_speed: 0.0,
+            done: true,
+            paused: false,
+            error: None,
+        },
+    );
+    tracing::info!("[download/http] {id} done ({downloaded} bytes → {})", dest.display());
+}
+
+/// Carries out the cancel or the pause asked for an HTTP download, whose
+/// .part file is closed by now.
+async fn stop_http_download(
+    downloads: &DownloadManager,
+    id: &str,
+    asked: u8,
+    part: &Path,
+    dest_dir: &Path,
+    (downloaded, total): (u64, u64),
+) {
+    if asked == crate::download::HTTP_CANCEL {
+        let _ = tokio::fs::remove_file(part).await;
+        if dest_dir != downloads.download_dir().as_path() {
+            cleanup_title_folder_if_empty(dest_dir).await;
+        }
+        downloads.clear_http_control(id);
+        tracing::info!("[download/http] {id} cancelled, partial file removed");
+        return;
+    }
+    let progress = if total > 0 { downloaded as f64 / total as f64 } else { 0.0 };
+    downloads.set_http_stats(
+        id,
+        HttpStats {
+            downloaded,
+            length: total,
+            progress,
+            download_speed: 0.0,
+            done: false,
+            paused: true,
+            error: None,
+        },
+    );
+    downloads.clear_http_control(id);
+    tracing::info!("[download/http] {id} paused at {downloaded} bytes");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{Body, Bytes};
+    use axum::http::{header, HeaderMap, StatusCode};
+    use axum::response::Response;
+    use futures::StreamExt;
+
+    /// A server on a local port with one file, and the byte each request it
+    /// got asked from. Its first answer loses the connection after `cut`
+    /// bytes; the following ones are whole.
+    async fn flaky_server(file: Vec<u8>, cut: usize) -> (String, Arc<parking_lot::Mutex<Vec<usize>>>) {
+        let asked = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let app = axum::Router::new().route(
+            "/file.bin",
+            axum::routing::get(move |headers: HeaderMap| {
+                let (file, asked) = (file.clone(), asked.clone());
+                async move {
+                    let from = headers
+                        .get(header::RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("bytes=")?.strip_suffix('-')?.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let first = {
+                        let mut asked = asked.lock();
+                        asked.push(from);
+                        asked.len() == 1
+                    };
+                    if first {
+                        // The pause lets the client take the bytes sent before
+                        // the connection goes.
+                        let sent = Ok::<_, std::io::Error>(Bytes::copy_from_slice(&file[..cut]));
+                        let lost = async {
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            Err(std::io::Error::other("connection lost"))
+                        };
+                        let body = futures::stream::once(async { sent }).chain(futures::stream::once(lost));
+                        return Response::builder()
+                            .header(header::CONTENT_LENGTH, file.len())
+                            .body(Body::from_stream(body))
+                            .unwrap();
+                    }
+                    Response::builder()
+                        .status(if from > 0 { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK })
+                        .body(Body::from(file[from..].to_vec()))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/file.bin", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, seen)
+    }
+
+    /// A connection lost on the way: the download goes on from the bytes it
+    /// has, over a new one, instead of failing.
+    #[tokio::test]
+    async fn dropped_connection_resumes() {
+        let dir = std::env::temp_dir().join(format!("siiishub-download-test-{}", crate::sync::now_ms()));
+        let downloads = DownloadManager::new(dir.join("downloads.json"), dir.join("download"));
+        let file: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let (url, asked) = flaky_server(file.clone(), 100_000).await;
+
+        let id = http_id_for(&url);
+        let control = downloads.try_register_http_control(&id).unwrap();
+        let dest = dir.join("download").join("file.bin");
+        run_http_download(downloads.clone(), control, id.clone(), url, dest.clone(), false).await;
+
+        let stats = downloads.http_stats(&id).unwrap();
+        assert!(stats.done, "{:?}", stats.error);
+        assert_eq!(std::fs::read(&dest).unwrap(), file);
+        assert_eq!(*asked.lock(), [0, 100_000]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
