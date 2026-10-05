@@ -483,12 +483,9 @@ function populateDownloadRow(row, unit) {
 
   const playBtn = row.querySelector('.dl-row-btn--play');
   if (playBtn) {
-    // A single finished file (local drop, completed HTTP) or a single-file
-    // torrent that is complete or streaming is playable in-app.
-    const playable = entries.length === 1
-      && ((isReady && (head.kind === 'local' || head.kind === 'http'))
-        || (head.kind === 'torrent' && (isReady || head.stats?.live === true)));
-    playBtn.hidden = !playable;
+    // A single file is playable in-app once it is complete: a torrent still
+    // downloading keeps its row to pause, folder and trash.
+    playBtn.hidden = !(entries.length === 1 && isReady);
   }
 
   const pauseBtn = row.querySelector('.dl-row-btn--pause');
